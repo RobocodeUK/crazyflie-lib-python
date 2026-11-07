@@ -27,6 +27,7 @@ See udpserver.py for the protocol"""
 import re
 import socket
 import binascii
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -36,6 +37,13 @@ from .exceptions import WrongUriType
 
 __author__ = 'Bitcraze AB'
 __all__ = ['UdpDriver']
+
+# ESP-Drone drops the link (and stops all logging) if it receives nothing
+# for 1 s. cfclient only sends when a gamepad is active, so keep the link
+# alive with a CRTP link-port packet (port 15, channel 3) that the drone
+# ignores. Payload is header 0xFF, data 01 01, checksum 01.
+KEEPALIVE_PACKET = b'\xFF\x01\x01\x01'
+KEEPALIVE_INTERVAL_S = 0.1
 
 
 class UdpDriver(CRTPDriver):
@@ -60,6 +68,11 @@ class UdpDriver(CRTPDriver):
         self.socket.connect(self.addr)
 
         self.socket.sendto('\xFF\x01\x01\x01'.encode(), self.addr)
+
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, name='UdpKeepAlive', daemon=True)
+        self._keepalive_thread.start()
 
         if self.debug:
             print("Connected to UDP server")
@@ -110,7 +123,20 @@ class UdpDriver(CRTPDriver):
         if self.debug:
             print("send: {}".format(binascii.hexlify(raw)))
 
+    def _keepalive_loop(self):
+        while not self._keepalive_stop.wait(KEEPALIVE_INTERVAL_S):
+            sock = self.socket
+            if sock is None:
+                return
+            try:
+                sock.sendto(KEEPALIVE_PACKET, self.addr)
+            except OSError:
+                return
+
     def close(self):
+        # Stop the keep-alive first so it can't send after the disconnect
+        self._keepalive_stop.set()
+        self._keepalive_thread.join(timeout=1)
         # Remove this from the server clients list
         self.socket.sendto('\xFF\x01\x02\x02'.encode(), self.addr)
         if self.debug:
